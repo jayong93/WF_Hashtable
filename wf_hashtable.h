@@ -120,11 +120,11 @@ class WF_HashTable
     {
         size_t prefix;
         unsigned depth;
-        BState *state;
+        atomic<BState *> state;
         vector<atomic_bool> toggle;
 
         Bucket(unsigned depth, unsigned thread_num) : prefix{0}, depth{depth}, state{new BState{thread_num}}, toggle{thread_num} {}
-        Bucket(const Bucket &other) : prefix{other.prefix}, depth{other.depth}, state{new BState{*other.state}}, toggle{other.toggle} {}
+        Bucket(const Bucket &other) : prefix{other.prefix}, depth{other.depth}, state{new BState{*(other.state.load(memory_order_acquire))}}, toggle{other.toggle} {}
         Bucket &operator=(const Bucket &other)
         {
             prefix = other.prefix;
@@ -137,13 +137,13 @@ class WF_HashTable
     struct DState
     {
         unsigned depth;
-        vector<Bucket *> dir;
+        vector<atomic<Bucket *>> dir;
 
         DState(unsigned depth) : depth{depth}, dir{(size_t)pow(2, depth)} {}
     };
 
 public:
-    WF_HashTable<Hasher, Key, Value>(unsigned thread_num) : thread_num{thread_num}, help{thread_num}, table{new DState{INITIAL_DEPTH}}
+    WF_HashTable<Hasher, Key, Value>(unsigned thread_num) : thread_num{thread_num}, help{thread_num}, op_seq_nums{thread_num, 0}, table{new DState{INITIAL_DEPTH}}
     {
     }
 
@@ -169,7 +169,7 @@ public:
 
     void update_bucket(Bucket *bucket)
     {
-        auto old_bstate = bucket->state;
+        auto old_bstate = bucket->state.load(memory_order_acquire);
         auto new_bstate = new BState{*old_bstate};
         auto toggle = bucket->toggle;
 
@@ -190,6 +190,8 @@ public:
                 }
             }
         }
+        new_bstate->applied = toggle;
+        bucket->state.compare_exchange_strong(old_bstate, new_bstate);
     }
 
     void apply_op(size_t key)
@@ -206,24 +208,33 @@ public:
         }
     }
 
-    void resize_if_needed()
+    void resize_if_needed(size_t key, size_t seq_num)
     {
+        DState *local_table = table.load(memory_order_acquire);
+        Bucket *bucket = local_table->dir[get_prefix(key, local_table->depth)];
+        BState *state = bucket->state.load(memory_order_acquire);
+
+        if (state->results[get_tid()].seq_num != seq_num)
+        {
+            resize();
+        }
     }
 
     typename Result::Status insert(Key &&key, const Value &value)
     {
         // key에서 hash 값 구하기
         size_t hash_key = Hasher{}(key);
+        const auto tid = get_tid();
         // help에 Op 등록 => 다른 thread들이 도울 수 있게
-        auto seq_num = op_seq_num.fetch_add(1, memory_order_relaxed);
+        auto seq_num = ++op_seq_nums[tid];
         announce(OP::Insert, hash_key, value, seq_num);
         // Wait-Free Op 적용
         apply_op(hash_key);
         // Resize가 필요하면 Resize
-        resize_if_needed();
+        resize_if_needed(hash_key, seq_num);
 
         auto local_table = table.load(memory_order_acquire);
-        return local_table->dir[local_table->get_prefix(hash_key)].state->results[get_tid()].status;
+        return local_table->dir[get_prefix(hash_key, local_table->depth)].state->results[tid].status;
     }
 
     static constexpr unsigned INITIAL_DEPTH = 2;
@@ -242,7 +253,7 @@ private:
 
     atomic<DState *> table;
     vector<Operation> help;
-    atomic_size_t op_seq_num{0};
+    vector<size_t> op_seq_nums;
 
     const unsigned thread_num;
 };
