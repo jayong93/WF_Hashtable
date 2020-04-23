@@ -14,7 +14,7 @@ static atomic_uint id_counter{0};
 static thread_local int thread_id = id_counter.fetch_add(1, memory_order_relaxed);
 
 static constexpr unsigned BSTATE_ITEM_NUM = 4;
-template <typename Key, typename Value, typename Hasher=hash<Key>>
+template <typename Key, typename Value, typename Hasher = hash<Key>>
 class WF_HashTable
 {
     enum class OP
@@ -40,16 +40,18 @@ class WF_HashTable
             Fail
         } status;
         size_t seq_num{0};
+
+        explicit Result() : status{Status::True}, seq_num{0} {}
     };
 
     struct BState
     {
         using Status = typename Result::Status;
         array<optional<pair<size_t, Value>>, BSTATE_ITEM_NUM> items;
-        vector<atomic_bool> applied;
+        vector<bool> applied;
         vector<Result> results;
 
-        BState(unsigned thread_num) : applied{thread_num}, results{thread_num} {}
+        explicit BState(unsigned thread_num) : applied{thread_num}, results{thread_num} {}
 
         Status insert(size_t key, const Value &val)
         {
@@ -71,7 +73,7 @@ class WF_HashTable
             // key가 없고 빈자리가 있으면 삽입
             else if (status == Status::True)
             {
-                (*empty_it)->emplace(val);
+                empty_it->emplace(key, val);
             }
             return status;
         }
@@ -97,7 +99,7 @@ class WF_HashTable
 
         bool is_full() const
         {
-            return all_of(items.begin(), items.back(), [](auto &item) { return item; });
+            return all_of(items.begin(), items.end(), [](const optional<pair<size_t, Value>> &item) { return bool(item); });
         }
 
     private:
@@ -127,17 +129,34 @@ class WF_HashTable
         size_t prefix;
         unsigned depth;
         atomic<BState *> state;
-        vector<atomic_bool> toggle;
+        vector<bool> toggle;
 
-        Bucket(unsigned depth, unsigned thread_num) : prefix{0}, depth{depth}, state{new BState{thread_num}}, toggle{thread_num} {}
+        explicit Bucket(unsigned depth, unsigned thread_num) : prefix{0}, depth{depth}, state{new BState{thread_num}}, toggle{thread_num} {}
+        explicit Bucket(const Bucket &other) : prefix{other.prefix}, depth{other.depth}, state{other.state.load(memory_order_acquire)}, toggle{other.toggle} {}
+        Bucket &operator=(const Bucket &other)
+        {
+            prefix = other.prefix;
+            depth = other.depth;
+            state = other.state.load(memory_order_acquire);
+            toggle = other.toggle;
+        }
     };
 
     struct DState
     {
         unsigned depth;
-        vector<atomic<Bucket *>> dir;
+        vector<atomic<Bucket *>*> dir;
 
-        DState(unsigned depth) : depth{depth}, dir{(size_t)pow(2, depth)} {}
+        DState(unsigned depth) : depth{depth}, dir{} {
+            for(auto i=0; i<(1<<depth); ++i) {
+                dir[i] = new atomic<Bucket*>;
+            }
+        }
+        ~DState() {
+            for(auto p : dir) {
+                delete p;
+            }
+        }
     };
 
 public:
@@ -195,10 +214,11 @@ public:
     void apply_op(size_t key)
     {
         DState *local_table = table.load(memory_order_acquire);
-        Bucket *bucket = local_table->dir[get_prefix(key, local_table->depth)];
+        Bucket *bucket = local_table->dir[get_prefix(key, local_table->depth)]->load(memory_order_acquire);
         // 현재 thread가 이 bucket에 update를 시도한다는 것을 알림
         // 충돌하는 다른 thread들은 이걸 보고 도와줌
-        bucket->toggle[get_tid()].fetch_xor(true);
+        auto toggle = bucket->toggle[get_tid()];
+        bucket->toggle[get_tid()] = !toggle;
 
         for (int i = 0; i < 2; ++i)
         {
@@ -207,35 +227,79 @@ public:
         }
     }
 
+    pair<Bucket *, Bucket *> split_bucket(const Bucket &from)
+    {
+        const BState &org_state = *(from.state.load(memory_order_acquire));
+        Bucket *new_b1 = new Bucket{from};
+        new_b1->depth = from.depth + 1;
+        new_b1->prefix = from.prefix << 1;
+        BState *b1_state = new BState{(unsigned)org_state.applied.size()};
+        b1_state->results = org_state.results;
+        b1_state->applied = new_b1->toggle;
+        new_b1->state.store(b1_state, memory_order_release);
+
+        Bucket *new_b2 = new Bucket{*new_b1};
+        new_b2->prefix = new_b1->prefix + 1;
+        BState *b2_state = new BState{*b1_state};
+        new_b2->state.store(b2_state, memory_order_release);
+
+        for (auto &item : org_state.items)
+        {
+            if (!item)
+                continue;
+            const auto &[key, value] = *item;
+            if (get_prefix(key, new_b1->depth) == new_b1->prefix)
+            {
+                auto it = find_if(b1_state->items.begin(), b1_state->items.end(), [](auto &item) {
+                    return item;
+                });
+                it->emplace(key, value);
+            }
+            else
+            {
+                auto it = find_if(b2_state->items.begin(), b2_state->items.end(), [](auto &item) {
+                    return item;
+                });
+                it->emplace(key, value);
+            }
+        }
+
+        return make_pair(new_b1, new_b2);
+    }
+
+    void update_directory(DState &table, const Bucket &buck1, const Bucket &buck2)
+    {
+    }
+
     void apply_pending_resize(DState &table, const Bucket &bucket_full)
     {
         for (auto i = 0; i < help.size(); ++i)
         {
-            const Operation &op = *help[i].load(memory_order_relaxed);
+            const Operation &op = *help[i];
             if (get_prefix(op.key, bucket_full.depth) != bucket_full.prefix)
                 continue;
-            const BState& state = bucket_full.state.load(memory_order_relaxed);
-            if (state->results[i].seq_num >= op.seq_num)
+            const BState &state = *bucket_full.state.load(memory_order_relaxed);
+            if (state.results[i].seq_num >= op.seq_num)
                 continue;
 
-            Bucket* dest = table.dir[get_prefix(op.key, table.depth)].load(memory_order_relaxed);
-            BState* dest_state = dest->state.load(memory_order_relaxed);
+            Bucket *dest = table.dir[get_prefix(op.key, table.depth)]->load(memory_order_relaxed);
+            BState *dest_state = dest->state.load(memory_order_relaxed);
             while (dest_state->is_full())
             {
-                auto [new_buck1, new_buck2] = split_bucket(dest);
-                update_directory(table, new_buck1, new_buck2);
-                dest = table.dir[get_prefix(op.key, table.depth)].load(memory_order_relaxed);
+                auto [new_buck1, new_buck2] = split_bucket(*dest);
+                update_directory(table, *new_buck1, *new_buck2);
+                dest = table.dir[get_prefix(op.key, table.depth)]->load(memory_order_relaxed);
                 dest_state = dest->state.load(memory_order_relaxed);
             }
-            dest_state->results[i].status = exec_on_bucket(dest, op);
+            dest_state->results[i].status = exec_on_bucket(dest_state, op);
             dest_state->results[i].seq_num = op.seq_num;
         }
     }
 
     void update_new_table(DState &table, int thread_id)
     {
-        const Operation &op = help[thread_id];
-        Bucket *bucket = table.dir[get_prefix(op.key, table.depth)].load(memory_order_relaxed);
+        const Operation &op = *help[thread_id];
+        Bucket *bucket = table.dir[get_prefix(op.key, table.depth)]->load(memory_order_relaxed);
         BState *state = bucket->state.load(memory_order_relaxed);
         if (state->is_full() && state->results[thread_id].seq_num < op.seq_num)
         {
@@ -263,7 +327,7 @@ public:
     void resize_if_needed(size_t key, size_t seq_num)
     {
         DState *local_table = table.load(memory_order_acquire);
-        Bucket *bucket = local_table->dir[get_prefix(key, local_table->depth)];
+        Bucket *bucket = local_table->dir[get_prefix(key, local_table->depth)]->load(memory_order_acquire);
         BState *state = bucket->state.load(memory_order_acquire);
 
         if (state->results[get_tid()].seq_num != seq_num)
@@ -286,7 +350,7 @@ public:
         resize_if_needed(hash_key, seq_num);
 
         auto local_table = table.load(memory_order_acquire);
-        return local_table->dir[get_prefix(hash_key, local_table->depth)].state->results[tid].status;
+        return local_table->dir[get_prefix(hash_key, local_table->depth)]->load(memory_order_release)->state.load(memory_order_release)->results[tid].status;
     }
 
     static constexpr unsigned INITIAL_DEPTH = 2;
