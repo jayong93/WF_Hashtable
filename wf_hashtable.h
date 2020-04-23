@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cassert>
 #include <optional>
+#include <functional>
 
 using namespace std;
 
@@ -13,7 +14,7 @@ static atomic_uint id_counter{0};
 static thread_local int thread_id = id_counter.fetch_add(1, memory_order_relaxed);
 
 static constexpr unsigned BSTATE_ITEM_NUM = 4;
-template <typename Hasher, typename Key, typename Value>
+template <typename Key, typename Value, typename Hasher=hash<Key>>
 class WF_HashTable
 {
     enum class OP
@@ -94,6 +95,11 @@ class WF_HashTable
             return status;
         }
 
+        bool is_full() const
+        {
+            return all_of(items.begin(), items.back(), [](auto &item) { return item; });
+        }
+
     private:
         // item을 순회하면서 빈자리가 있는 경우 반환, 비어있지 않은 item에 대해 lambda 수행
         template <typename F>
@@ -124,14 +130,6 @@ class WF_HashTable
         vector<atomic_bool> toggle;
 
         Bucket(unsigned depth, unsigned thread_num) : prefix{0}, depth{depth}, state{new BState{thread_num}}, toggle{thread_num} {}
-        Bucket(const Bucket &other) : prefix{other.prefix}, depth{other.depth}, state{new BState{*(other.state.load(memory_order_acquire))}}, toggle{other.toggle} {}
-        Bucket &operator=(const Bucket &other)
-        {
-            prefix = other.prefix;
-            depth = other.depth;
-            state = new BState{*other.state};
-            toggle = other.toggle;
-        }
     };
 
     struct DState
@@ -143,13 +141,13 @@ class WF_HashTable
     };
 
 public:
-    WF_HashTable<Hasher, Key, Value>(unsigned thread_num) : thread_num{thread_num}, help{thread_num}, op_seq_nums{thread_num, 0}, table{new DState{INITIAL_DEPTH}}
+    WF_HashTable<Key, Value, Hasher>(unsigned thread_num) : thread_num{thread_num}, help{thread_num}, op_seq_nums{thread_num, 0}, table{new DState{INITIAL_DEPTH}}
     {
     }
 
     void announce(OP op, size_t key, const Value &value, size_t seq_num)
     {
-        help[get_tid()] = Operation{op, key, value, seq_num};
+        help[get_tid()] = new Operation{op, key, value, seq_num};
     }
 
     typename Result::Status exec_on_bucket(BState *b, const Operation &op)
@@ -167,7 +165,7 @@ public:
         return result;
     }
 
-    void update_bucket(Bucket *bucket)
+    bool update_bucket(Bucket *bucket)
     {
         auto old_bstate = bucket->state.load(memory_order_acquire);
         auto new_bstate = new BState{*old_bstate};
@@ -180,7 +178,7 @@ public:
                 continue;
 
             Result &result = new_bstate->results[i];
-            const Operation &help_op = help[i];
+            const Operation &help_op = *help[i];
             if (result.seq_num < help_op.seq_num)
             {
                 result.status = exec_on_bucket(new_bstate, help_op);
@@ -191,7 +189,7 @@ public:
             }
         }
         new_bstate->applied = toggle;
-        bucket->state.compare_exchange_strong(old_bstate, new_bstate);
+        return bucket->state.compare_exchange_strong(old_bstate, new_bstate);
     }
 
     void apply_op(size_t key)
@@ -200,11 +198,65 @@ public:
         Bucket *bucket = local_table->dir[get_prefix(key, local_table->depth)];
         // 현재 thread가 이 bucket에 update를 시도한다는 것을 알림
         // 충돌하는 다른 thread들은 이걸 보고 도와줌
-        bucket->toggle[get_tid()].fetch_xor(true, memory_order_relaxed);
+        bucket->toggle[get_tid()].fetch_xor(true);
 
         for (int i = 0; i < 2; ++i)
         {
-            update_bucket(bucket);
+            if (update_bucket(bucket))
+                break;
+        }
+    }
+
+    void apply_pending_resize(DState &table, const Bucket &bucket_full)
+    {
+        for (auto i = 0; i < help.size(); ++i)
+        {
+            const Operation &op = *help[i].load(memory_order_relaxed);
+            if (get_prefix(op.key, bucket_full.depth) != bucket_full.prefix)
+                continue;
+            const BState& state = bucket_full.state.load(memory_order_relaxed);
+            if (state->results[i].seq_num >= op.seq_num)
+                continue;
+
+            Bucket* dest = table.dir[get_prefix(op.key, table.depth)].load(memory_order_relaxed);
+            BState* dest_state = dest->state.load(memory_order_relaxed);
+            while (dest_state->is_full())
+            {
+                auto [new_buck1, new_buck2] = split_bucket(dest);
+                update_directory(table, new_buck1, new_buck2);
+                dest = table.dir[get_prefix(op.key, table.depth)].load(memory_order_relaxed);
+                dest_state = dest->state.load(memory_order_relaxed);
+            }
+            dest_state->results[i].status = exec_on_bucket(dest, op);
+            dest_state->results[i].seq_num = op.seq_num;
+        }
+    }
+
+    void update_new_table(DState &table, int thread_id)
+    {
+        const Operation &op = help[thread_id];
+        Bucket *bucket = table.dir[get_prefix(op.key, table.depth)].load(memory_order_relaxed);
+        BState *state = bucket->state.load(memory_order_relaxed);
+        if (state->is_full() && state->results[thread_id].seq_num < op.seq_num)
+        {
+            apply_pending_resize(table, *bucket);
+        }
+    }
+
+    void resize()
+    {
+        for (auto i = 0; i < 2; ++i)
+        {
+            DState *old_table = table.load(memory_order_relaxed);
+            DState *new_table = new DState{*old_table};
+
+            for (auto i = 0; i < help.size(); ++i)
+            {
+                update_new_table(*new_table, i);
+            }
+
+            if (true == table.compare_exchange_strong(old_table, new_table))
+                break;
         }
     }
 
@@ -252,7 +304,7 @@ private:
     }
 
     atomic<DState *> table;
-    vector<Operation> help;
+    vector<Operation *> help;
     vector<size_t> op_seq_nums;
 
     const unsigned thread_num;
