@@ -145,17 +145,45 @@ class WF_HashTable
     struct DState
     {
         unsigned depth;
-        vector<atomic<Bucket *>*> dir;
+        vector<atomic<Bucket *> *> dir;
 
-        DState(unsigned depth) : depth{depth}, dir{} {
-            for(auto i=0; i<(1<<depth); ++i) {
-                dir[i] = new atomic<Bucket*>;
+        DState(unsigned depth) : depth{depth}, dir{}
+        {
+            for (auto i = 0; i < (1 << depth); ++i)
+            {
+                dir[i] = new atomic<Bucket *>;
             }
         }
-        ~DState() {
-            for(auto p : dir) {
+        ~DState()
+        {
+            for (auto p : dir)
+            {
                 delete p;
             }
+        }
+
+        void resize(unsigned new_depth)
+        {
+            if (new_depth <= depth)
+                return;
+            vector<atomic<Bucket *> *> new_dir;
+            for (auto i = 0; i < (1 << new_depth); ++i)
+            {
+                new_dir.emplace_back(new atomic<Bucket *>{nullptr});
+            }
+            for (auto bucket : dir)
+            {
+                Bucket *b = bucket->load(memory_order_relaxed);
+                for (auto i = 0; i < (1 << new_depth); ++i)
+                {
+                    if ((i >> (new_depth - b->depth)) == b->prefix)
+                    {
+                        new_dir[i]->store(b, memory_order_relaxed);
+                    }
+                }
+            }
+
+            depth = new_depth;
         }
     };
 
@@ -267,8 +295,21 @@ public:
         return make_pair(new_b1, new_b2);
     }
 
-    void update_directory(DState &table, const Bucket &buck1, const Bucket &buck2)
+    void update_directory(DState &table, Bucket &buck1, Bucket &buck2)
     {
+        Bucket *buckets[2] = {&buck1, &buck2};
+        for (auto b : buckets)
+        {
+            if (table.depth < b->depth)
+            {
+                table.resize(table.depth + 1);
+            }
+            for(auto i=0; i<table.dir.size(); ++i) {
+                if (i >> (table.depth - b->depth) == b->prefix) {
+                    table.dir[i]->store(b, memory_order_relaxed);
+                }
+            }
+        }
     }
 
     void apply_pending_resize(DState &table, const Bucket &bucket_full)
