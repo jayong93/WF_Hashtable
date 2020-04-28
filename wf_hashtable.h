@@ -7,6 +7,7 @@
 #include <cassert>
 #include <optional>
 #include <functional>
+#include <iostream>
 
 using namespace std;
 
@@ -51,7 +52,16 @@ class WF_HashTable
         vector<bool> applied;
         vector<Result> results;
 
-        explicit BState(unsigned thread_num) : applied{thread_num}, results{thread_num} {}
+        explicit BState(unsigned thread_num)
+        {
+            applied.reserve(thread_num);
+            results.reserve(thread_num);
+            for (auto i = 0; i < thread_num; ++i)
+            {
+                applied.emplace_back(false);
+                results.emplace_back();
+            }
+        }
 
         Status insert(size_t key, const Value &val)
         {
@@ -131,7 +141,13 @@ class WF_HashTable
         atomic<BState *> state;
         vector<bool> toggle;
 
-        explicit Bucket(unsigned depth, unsigned thread_num) : prefix{0}, depth{depth}, state{new BState{thread_num}}, toggle{thread_num} {}
+        explicit Bucket(unsigned depth, unsigned thread_num) : prefix{0}, depth{depth}, state{new BState{thread_num}}
+        {
+            toggle.reserve(thread_num);
+            for(auto i=0; i<thread_num; ++i) {
+                toggle.emplace_back(false);
+            }
+        }
         explicit Bucket(const Bucket &other) : prefix{other.prefix}, depth{other.depth}, state{other.state.load(memory_order_acquire)}, toggle{other.toggle} {}
         Bucket &operator=(const Bucket &other)
         {
@@ -147,11 +163,27 @@ class WF_HashTable
         unsigned depth;
         vector<atomic<Bucket *> *> dir;
 
-        DState(unsigned depth) : depth{depth}, dir{}
+        DState(unsigned depth, unsigned thread_num) : depth{depth}, dir{(1u << depth), nullptr}
         {
-            for (auto i = 0; i < (1 << depth); ++i)
+            unsigned i;
+            for (i = 0; i < (1 << depth - 1); ++i)
             {
-                dir[i] = new atomic<Bucket *>;
+                Bucket *bucket = new Bucket{1, thread_num};
+                bucket->prefix = 0;
+                dir[i] = new atomic<Bucket *>{bucket};
+            }
+            for (; i < (1 << depth); ++i)
+            {
+                Bucket *bucket = new Bucket{1, thread_num};
+                bucket->prefix = 1;
+                dir[i] = new atomic<Bucket *>{bucket};
+            }
+        }
+        DState(const DState &other) : depth{other.depth}, dir{(1u << depth), nullptr}
+        {
+            for (auto i = 0; i < dir.size(); ++i)
+            {
+                dir[i] = new atomic<Bucket *>{other.dir[i]->load(memory_order_relaxed)};
             }
         }
         ~DState()
@@ -188,7 +220,7 @@ class WF_HashTable
     };
 
 public:
-    WF_HashTable<Key, Value, Hasher>(unsigned thread_num) : thread_num{thread_num}, help{thread_num}, op_seq_nums{thread_num, 0}, table{new DState{INITIAL_DEPTH}}
+    WF_HashTable<Key, Value, Hasher>(unsigned thread_num) : thread_num{thread_num}, help{thread_num}, op_seq_nums{thread_num, 0}, table{new DState{INITIAL_DEPTH, thread_num}}
     {
     }
 
@@ -304,8 +336,10 @@ public:
             {
                 table.resize(table.depth + 1);
             }
-            for(auto i=0; i<table.dir.size(); ++i) {
-                if (i >> (table.depth - b->depth) == b->prefix) {
+            for (auto i = 0; i < table.dir.size(); ++i)
+            {
+                if (i >> (table.depth - b->depth) == b->prefix)
+                {
                     table.dir[i]->store(b, memory_order_relaxed);
                 }
             }
@@ -411,20 +445,41 @@ public:
         return local_table->dir[get_prefix(hash_key, local_table->depth)]->load(memory_order_release)->state.load(memory_order_release)->results[tid].status;
     }
 
-    optional<Value> lookup(const Key& key) {
+    optional<Value> lookup(const Key &key)
+    {
         size_t hash_key = Hasher{}(key);
-        DState* local_table = table.load(memory_order_acquire);
-        BState* state = local_table->dir[get_prefix(hash_key, local_table->depth)]
+        DState *local_table = table.load(memory_order_acquire);
+        BState *state = local_table->dir[get_prefix(hash_key, local_table->depth)]
                             ->load(memory_order_acquire)
                             ->state.load(memory_order_acquire);
-        
-        auto it = find_if(state->items.begin(), state->items.end(), [hash_key](auto& item) {
+
+        auto it = find_if(state->items.begin(), state->items.end(), [hash_key](auto &item) {
             return item && item->first == hash_key;
         });
-        if (it == state->items.end()) {
+        if (it == state->items.end())
+        {
             return nullopt;
         }
         return (*it)->second;
+    }
+
+    void dump()
+    {
+        DState *local_table = table.load(memory_order_acquire);
+        printf("Dump(<HashKey, Value>):\n");
+        for (const auto &dir_entry : local_table->dir)
+        {
+            Bucket *bucket = dir_entry->load(memory_order_relaxed);
+            BState *state = bucket->state.load(memory_order_relaxed);
+            for (const auto &item : state->items)
+            {
+                if (item)
+                {
+                    cout << "<" << item->first << ", " << item->second << ">, ";
+                }
+            }
+        }
+        cout << endl;
     }
 
     static constexpr unsigned INITIAL_DEPTH = 2;
