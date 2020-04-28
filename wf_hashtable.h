@@ -394,6 +394,39 @@ public:
         return local_table->dir[get_prefix(hash_key, local_table->depth)]->load(memory_order_release)->state.load(memory_order_release)->results[tid].status;
     }
 
+    typename Result::Status remove(Key &&key)
+    {
+        // key에서 hash 값 구하기
+        size_t hash_key = Hasher{}(key);
+        const auto tid = get_tid();
+        // help에 Op 등록 => 다른 thread들이 도울 수 있게
+        auto seq_num = ++op_seq_nums[tid];
+        announce(OP::Remove, hash_key, Value{}, seq_num);
+        // Wait-Free Op 적용
+        apply_op(hash_key);
+        // Resize가 필요하면 Resize
+        resize_if_needed(hash_key, seq_num);
+
+        auto local_table = table.load(memory_order_acquire);
+        return local_table->dir[get_prefix(hash_key, local_table->depth)]->load(memory_order_release)->state.load(memory_order_release)->results[tid].status;
+    }
+
+    optional<Value> lookup(const Key& key) {
+        size_t hash_key = Hasher{}(key);
+        DState* local_table = table.load(memory_order_acquire);
+        BState* state = local_table->dir[get_prefix(hash_key, local_table->depth)]
+                            ->load(memory_order_acquire)
+                            ->state.load(memory_order_acquire);
+        
+        auto it = find_if(state->items.begin(), state->items.end(), [hash_key](auto& item) {
+            return item && item->first == hash_key;
+        });
+        if (it == state->items.end()) {
+            return nullopt;
+        }
+        return (*it)->second;
+    }
+
     static constexpr unsigned INITIAL_DEPTH = 2;
 
 private:
