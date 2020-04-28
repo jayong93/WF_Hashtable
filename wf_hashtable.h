@@ -8,6 +8,7 @@
 #include <optional>
 #include <functional>
 #include <iostream>
+#include <unordered_set>
 
 using namespace std;
 
@@ -15,8 +16,6 @@ static atomic_uint id_counter{0};
 static thread_local int thread_id = id_counter.fetch_add(1, memory_order_relaxed);
 
 static constexpr unsigned BSTATE_ITEM_NUM = 4;
-static constexpr uint64_t EPOCH_INCREASE_RATE = 50;
-static constexpr uint64_t EMPTY_RATE = 100;
 
 template <typename Key, typename Value, typename Hasher, typename HashType>
 class WF_HashTable
@@ -153,7 +152,8 @@ class WF_HashTable
             }
         }
         explicit Bucket(const Bucket &other) : prefix{other.prefix}, depth{other.depth}, state{other.state.load(memory_order_acquire)}, toggle{other.toggle} {}
-        ~Bucket() {
+        ~Bucket()
+        {
             auto s = state.load(memory_order_relaxed);
             if (s != nullptr)
             {
@@ -232,35 +232,66 @@ class WF_HashTable
     };
 
 public:
-    WF_HashTable<Key, Value, Hasher, HashType>(unsigned thread_num) : thread_num{thread_num}, help{thread_num}, op_seq_nums{thread_num, 0}, table{new DState{INITIAL_DEPTH, thread_num}}, dstates_retired{thread_num}, buckets_retired{thread_num}, bstates_retired{thread_num}
+    WF_HashTable<Key, Value, Hasher, HashType>(unsigned thread_num) : thread_num{thread_num}, help{thread_num}, op_seq_nums{thread_num, 0}, table{new DState{INITIAL_DEPTH, thread_num}}, global_epoch{0}
     {
+        for (auto i=0; i<thread_num; ++i)
+        {
+            dstates_retired.emplace_back();
+            buckets_retired.emplace_back();
+            bstates_retired.emplace_back();
+            thread_counter.emplace_back(0);
+            thread_epochs.emplace_back(new atomic_uint64_t{0});
+        }
     }
 
     ~WF_HashTable<Key, Value, Hasher, HashType>()
     {
-        DState &l_table = *table.load(memory_order_acquire);
-        for (auto entry : l_table.dir)
-        {
-            Bucket* bucket = entry->load(memory_order_acquire);
-            delete bucket;
-            delete entry;
-        }
+        // DState *l_table = table.load(memory_order_acquire);
+        // Bucket *prev_bucket = nullptr;
+        // for (auto entry : l_table->dir)
+        // {
+        //     Bucket *bucket = entry->load(memory_order_acquire);
+        //     if (prev_bucket == bucket)
+        //     {
+        //         continue;
+        //     }
+        //     else if (prev_bucket == nullptr)
+        //     {
+        //         prev_bucket = bucket;
+        //     }
+        //     else {
+        //         delete prev_bucket;
+        //         prev_bucket = bucket;
+        //     }
+        // }
+        // delete prev_bucket;
+        // delete l_table;
 
-        for(auto& dstates : dstates_retired) {
-            for(auto ptr : dstates) {
-                delete ptr;
-            }
-        }
-        for(auto& buckets : buckets_retired) {
-            for(auto ptr : buckets) {
-                delete ptr;
-            }
-        }
-        for(auto& bstates : bstates_retired) {
-            for(auto ptr : bstates) {
-                delete ptr;
-            }
-        }
+        // for (auto &dstates : dstates_retired)
+        // {
+        //     for (auto retired : dstates)
+        //     {
+        //         delete retired.ptr;
+        //     }
+        // }
+        // for (auto &buckets : buckets_retired)
+        // {
+        //     for (auto retired : buckets)
+        //     {
+        //         delete retired.ptr;
+        //     }
+        // }
+        // for (auto &bstates : bstates_retired)
+        // {
+        //     for (auto retired : bstates)
+        //     {
+        //         delete retired.ptr;
+        //     }
+        // }
+        // for (auto p_epoch : thread_epochs)
+        // {
+        //     delete p_epoch;
+        // }
     }
 
     void announce(OP op, size_t key, const Value &value, size_t seq_num)
@@ -309,7 +340,12 @@ public:
             }
         }
         new_bstate->applied = toggle;
-        return bucket->state.compare_exchange_strong(old_bstate, new_bstate);
+        auto is_successed = bucket->state.compare_exchange_strong(old_bstate, new_bstate);
+        if (is_successed)
+        {
+            retire(old_bstate);
+        }
+        return is_successed;
     }
 
     void apply_op(HashType key)
@@ -381,16 +417,20 @@ public:
             }
             for (auto i = 0; i < table.dir.size(); ++i)
             {
-                if (i >> (table.depth - b->depth) == b->prefix)
+                auto entry_prefix = i >> (table.depth - b->depth);
+                if (entry_prefix == b->prefix)
                 {
                     table.dir[i]->store(b, memory_order_relaxed);
                 }
+                else if (b->prefix < entry_prefix)
+                    break;
             }
         }
     }
 
-    void apply_pending_resize(DState &table, const Bucket &bucket_full)
+    vector<Bucket *> apply_pending_resize(DState &table, const Bucket &bucket_full)
     {
+        vector<Bucket *> retired_buckets;
         for (auto i = 0; i < help.size(); ++i)
         {
             if (help[i] == nullptr)
@@ -408,41 +448,54 @@ public:
             {
                 auto [new_buck1, new_buck2] = split_bucket(*dest);
                 update_directory(table, *new_buck1, *new_buck2);
+                retired_buckets.emplace_back(dest);
                 dest = table.dir[get_prefix(op.key, table.depth)]->load(memory_order_relaxed);
                 dest_state = dest->state.load(memory_order_relaxed);
             }
             dest_state->results[i].status = exec_on_bucket(dest_state, op);
             dest_state->results[i].seq_num = op.seq_num;
         }
+        return retired_buckets;
     }
 
-    void update_new_table(DState &table, int thread_id)
+    vector<Bucket *> update_new_table(DState &table, int thread_id)
     {
+        vector<Bucket *> retired_buckets;
         if (help[thread_id] == nullptr)
-            return;
+            return retired_buckets;
         const Operation &op = *help[thread_id];
         Bucket *bucket = table.dir[get_prefix(op.key, table.depth)]->load(memory_order_relaxed);
         BState *state = bucket->state.load(memory_order_relaxed);
         if (state->is_full() && state->results[thread_id].seq_num < op.seq_num)
         {
-            apply_pending_resize(table, *bucket);
+            retired_buckets = apply_pending_resize(table, *bucket);
         }
+        return retired_buckets;
     }
 
     void resize()
     {
         for (auto i = 0; i < 2; ++i)
         {
+            vector<Bucket *> retired_buckets;
             DState *old_table = table.load(memory_order_relaxed);
             DState *new_table = new DState{*old_table};
 
             for (auto i = 0; i < help.size(); ++i)
             {
-                update_new_table(*new_table, i);
+                auto buckets = update_new_table(*new_table, i);
+                retired_buckets.insert(retired_buckets.end(), buckets.begin(), buckets.end());
             }
 
             if (true == table.compare_exchange_strong(old_table, new_table))
+            {
+                for (auto bucket : retired_buckets)
+                {
+                    retire(bucket);
+                }
+                retire(old_table);
                 break;
+            }
         }
     }
 
@@ -460,6 +513,7 @@ public:
 
     typename Result::Status insert(Key &&key, const Value &value)
     {
+        start_op();
         // key에서 hash 값 구하기
         HashType hash_key = Hasher{}(key);
         const auto tid = get_tid();
@@ -472,11 +526,14 @@ public:
         resize_if_needed(hash_key, seq_num);
 
         auto local_table = table.load(memory_order_acquire);
-        return local_table->dir[get_prefix(hash_key, local_table->depth)]->load(memory_order_release)->state.load(memory_order_release)->results[tid].status;
+        auto status = local_table->dir[get_prefix(hash_key, local_table->depth)]->load(memory_order_release)->state.load(memory_order_release)->results[tid].status;
+        end_op();
+        return status;
     }
 
     typename Result::Status remove(Key &&key)
     {
+        start_op();
         // key에서 hash 값 구하기
         HashType hash_key = Hasher{}(key);
         const auto tid = get_tid();
@@ -489,11 +546,14 @@ public:
         resize_if_needed(hash_key, seq_num);
 
         auto local_table = table.load(memory_order_acquire);
-        return local_table->dir[get_prefix(hash_key, local_table->depth)]->load(memory_order_release)->state.load(memory_order_release)->results[tid].status;
+        auto status = local_table->dir[get_prefix(hash_key, local_table->depth)]->load(memory_order_release)->state.load(memory_order_release)->results[tid].status;
+        end_op();
+        return status;
     }
 
     optional<Value> lookup(const Key &key)
     {
+        start_op();
         HashType hash_key = Hasher{}(key);
         DState *local_table = table.load(memory_order_acquire);
         BState *state = local_table->dir[get_prefix(hash_key, local_table->depth)]
@@ -505,9 +565,12 @@ public:
         });
         if (it == state->items.end())
         {
+            end_op();
             return nullopt;
         }
-        return (*it)->second;
+        auto ret_val = (*it)->second;
+        end_op();
+        return ret_val;
     }
 
     void dump()
@@ -529,7 +592,7 @@ public:
         cout << endl;
     }
 
-    static constexpr unsigned INITIAL_DEPTH = 2;
+    static constexpr unsigned INITIAL_DEPTH = 4;
 
 private:
     size_t get_prefix(HashType key, unsigned depth) const
@@ -543,14 +606,92 @@ private:
         return thread_id % thread_num;
     }
 
+    template <typename T>
+    struct EpochNode
+    {
+        T *ptr;
+        uint64_t retired_epoch;
+
+        EpochNode() : ptr{nullptr}, retired_epoch{0} {}
+        EpochNode(T *ptr, uint64_t epoch) : ptr{ptr}, retired_epoch{epoch} {}
+    };
+    void start_op()
+    {
+        auto tid = get_tid();
+        thread_epochs[tid]->store(global_epoch.load(memory_order_relaxed), memory_order_release);
+    }
+    void end_op()
+    {
+        auto tid = get_tid();
+        thread_epochs[tid]->store(UINT64_MAX, memory_order_release);
+    }
+    void retire_(int tid, DState *ptr, uint64_t epoch)
+    {
+        dstates_retired[tid].emplace_back(ptr, epoch);
+    }
+    void retire_(int tid, Bucket *ptr, uint64_t epoch)
+    {
+        buckets_retired[tid].emplace_back(ptr, epoch);
+    }
+    void retire_(int tid, BState *ptr, uint64_t epoch)
+    {
+        bstates_retired[tid].emplace_back(ptr, epoch);
+    }
+    void empty(int tid)
+    {
+        auto min_epoch = UINT64_MAX;
+        for (auto epoch : thread_epochs)
+        {
+            auto e = epoch->load(memory_order_acquire);
+            if (e < min_epoch)
+            {
+                min_epoch = e;
+            }
+        }
+
+        remove_retired(dstates_retired[tid], min_epoch);
+        remove_retired(buckets_retired[tid], min_epoch);
+        remove_retired(bstates_retired[tid], min_epoch);
+    }
+    template <typename T>
+    void remove_retired(vector<EpochNode<T>> &list, uint64_t min_epoch)
+    {
+        auto removed_it = remove_if(list.begin(), list.end(), [min_epoch](auto &r_node) {
+            if (r_node.retired_epoch < min_epoch)
+            {
+                delete r_node.ptr;
+                return true;
+            }
+            return false;
+        });
+
+        list.erase(removed_it, list.end());
+    }
+    template <typename T>
+    void retire(T *ptr)
+    {
+        auto tid = get_tid();
+        retire_(tid, ptr, global_epoch.load(memory_order_relaxed));
+        auto &counter = thread_counter[tid];
+        counter++;
+        if (counter % EPOCH_INCREASE_RATE == 0)
+            global_epoch.fetch_add(1, memory_order_relaxed);
+        if (counter % EMPTY_RATE == 0)
+            empty(tid);
+    }
+
     atomic<DState *> table;
     vector<Operation *> help;
     vector<size_t> op_seq_nums;
-    vector<vector<DState*>> dstates_retired;
-    vector<vector<Bucket*>> buckets_retired;
-    vector<vector<BState*>> bstates_retired;
-    vector<uint64_t> thread_epochs;
+
+    vector<vector<EpochNode<DState>>> dstates_retired;
+    vector<vector<EpochNode<Bucket>>> buckets_retired;
+    vector<vector<EpochNode<BState>>> bstates_retired;
+    vector<atomic_uint64_t *> thread_epochs;
+    vector<uint64_t> thread_counter;
     atomic_uint64_t global_epoch;
 
+    static constexpr uint64_t EPOCH_INCREASE_RATE = 50;
+    static constexpr uint64_t EMPTY_RATE = 100;
     const unsigned thread_num;
 };
