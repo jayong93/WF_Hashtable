@@ -15,7 +15,10 @@ static atomic_uint id_counter{0};
 static thread_local int thread_id = id_counter.fetch_add(1, memory_order_relaxed);
 
 static constexpr unsigned BSTATE_ITEM_NUM = 4;
-template <typename Key, typename Value, typename Hasher = hash<Key>>
+static constexpr uint64_t EPOCH_INCREASE_RATE = 50;
+static constexpr uint64_t EMPTY_RATE = 100;
+
+template <typename Key, typename Value, typename Hasher, typename HashType>
 class WF_HashTable
 {
     enum class OP
@@ -144,11 +147,20 @@ class WF_HashTable
         explicit Bucket(unsigned depth, unsigned thread_num) : prefix{0}, depth{depth}, state{new BState{thread_num}}
         {
             toggle.reserve(thread_num);
-            for(auto i=0; i<thread_num; ++i) {
+            for (auto i = 0; i < thread_num; ++i)
+            {
                 toggle.emplace_back(false);
             }
         }
         explicit Bucket(const Bucket &other) : prefix{other.prefix}, depth{other.depth}, state{other.state.load(memory_order_acquire)}, toggle{other.toggle} {}
+        ~Bucket() {
+            auto s = state.load(memory_order_relaxed);
+            if (s != nullptr)
+            {
+                delete s;
+            }
+        }
+
         Bucket &operator=(const Bucket &other)
         {
             prefix = other.prefix;
@@ -201,27 +213,54 @@ class WF_HashTable
             vector<atomic<Bucket *> *> new_dir;
             for (auto i = 0; i < (1 << new_depth); ++i)
             {
-                new_dir.emplace_back(new atomic<Bucket *>{nullptr});
-            }
-            for (auto bucket : dir)
-            {
-                Bucket *b = bucket->load(memory_order_relaxed);
-                for (auto i = 0; i < (1 << new_depth); ++i)
+                atomic<Bucket *> *new_entry = nullptr;
+                for (auto entry : dir)
                 {
-                    if ((i >> (new_depth - b->depth)) == b->prefix)
+                    Bucket *bucket = entry->load(memory_order_relaxed);
+                    if (bucket->prefix == (i >> (new_depth - bucket->depth)))
                     {
-                        new_dir[i]->store(b, memory_order_relaxed);
+                        new_entry = new atomic<Bucket *>{bucket};
                     }
                 }
+                assert(new_entry != nullptr && "a new directory entry has no bucket");
+                new_dir.emplace_back(new_entry);
             }
 
             depth = new_depth;
+            dir = move(new_dir);
         }
     };
 
 public:
-    WF_HashTable<Key, Value, Hasher>(unsigned thread_num) : thread_num{thread_num}, help{thread_num}, op_seq_nums{thread_num, 0}, table{new DState{INITIAL_DEPTH, thread_num}}
+    WF_HashTable<Key, Value, Hasher, HashType>(unsigned thread_num) : thread_num{thread_num}, help{thread_num}, op_seq_nums{thread_num, 0}, table{new DState{INITIAL_DEPTH, thread_num}}, dstates_retired{thread_num}, buckets_retired{thread_num}, bstates_retired{thread_num}
     {
+    }
+
+    ~WF_HashTable<Key, Value, Hasher, HashType>()
+    {
+        DState &l_table = *table.load(memory_order_acquire);
+        for (auto entry : l_table.dir)
+        {
+            Bucket* bucket = entry->load(memory_order_acquire);
+            delete bucket;
+            delete entry;
+        }
+
+        for(auto& dstates : dstates_retired) {
+            for(auto ptr : dstates) {
+                delete ptr;
+            }
+        }
+        for(auto& buckets : buckets_retired) {
+            for(auto ptr : buckets) {
+                delete ptr;
+            }
+        }
+        for(auto& bstates : bstates_retired) {
+            for(auto ptr : bstates) {
+                delete ptr;
+            }
+        }
     }
 
     void announce(OP op, size_t key, const Value &value, size_t seq_num)
@@ -257,6 +296,8 @@ public:
                 continue;
 
             Result &result = new_bstate->results[i];
+            if (help[i] == nullptr)
+                continue;
             const Operation &help_op = *help[i];
             if (result.seq_num < help_op.seq_num)
             {
@@ -271,7 +312,7 @@ public:
         return bucket->state.compare_exchange_strong(old_bstate, new_bstate);
     }
 
-    void apply_op(size_t key)
+    void apply_op(HashType key)
     {
         DState *local_table = table.load(memory_order_acquire);
         Bucket *bucket = local_table->dir[get_prefix(key, local_table->depth)]->load(memory_order_acquire);
@@ -311,15 +352,17 @@ public:
             if (get_prefix(key, new_b1->depth) == new_b1->prefix)
             {
                 auto it = find_if(b1_state->items.begin(), b1_state->items.end(), [](auto &item) {
-                    return item;
+                    return !item;
                 });
+                assert(it != b1_state->items.end() && "There is no place to insert item");
                 it->emplace(key, value);
             }
             else
             {
                 auto it = find_if(b2_state->items.begin(), b2_state->items.end(), [](auto &item) {
-                    return item;
+                    return !item;
                 });
+                assert(it != b2_state->items.end() && "There is no place to insert item");
                 it->emplace(key, value);
             }
         }
@@ -350,6 +393,8 @@ public:
     {
         for (auto i = 0; i < help.size(); ++i)
         {
+            if (help[i] == nullptr)
+                continue;
             const Operation &op = *help[i];
             if (get_prefix(op.key, bucket_full.depth) != bucket_full.prefix)
                 continue;
@@ -373,6 +418,8 @@ public:
 
     void update_new_table(DState &table, int thread_id)
     {
+        if (help[thread_id] == nullptr)
+            return;
         const Operation &op = *help[thread_id];
         Bucket *bucket = table.dir[get_prefix(op.key, table.depth)]->load(memory_order_relaxed);
         BState *state = bucket->state.load(memory_order_relaxed);
@@ -399,7 +446,7 @@ public:
         }
     }
 
-    void resize_if_needed(size_t key, size_t seq_num)
+    void resize_if_needed(HashType key, HashType seq_num)
     {
         DState *local_table = table.load(memory_order_acquire);
         Bucket *bucket = local_table->dir[get_prefix(key, local_table->depth)]->load(memory_order_acquire);
@@ -414,7 +461,7 @@ public:
     typename Result::Status insert(Key &&key, const Value &value)
     {
         // key에서 hash 값 구하기
-        size_t hash_key = Hasher{}(key);
+        HashType hash_key = Hasher{}(key);
         const auto tid = get_tid();
         // help에 Op 등록 => 다른 thread들이 도울 수 있게
         auto seq_num = ++op_seq_nums[tid];
@@ -431,7 +478,7 @@ public:
     typename Result::Status remove(Key &&key)
     {
         // key에서 hash 값 구하기
-        size_t hash_key = Hasher{}(key);
+        HashType hash_key = Hasher{}(key);
         const auto tid = get_tid();
         // help에 Op 등록 => 다른 thread들이 도울 수 있게
         auto seq_num = ++op_seq_nums[tid];
@@ -447,7 +494,7 @@ public:
 
     optional<Value> lookup(const Key &key)
     {
-        size_t hash_key = Hasher{}(key);
+        HashType hash_key = Hasher{}(key);
         DState *local_table = table.load(memory_order_acquire);
         BState *state = local_table->dir[get_prefix(hash_key, local_table->depth)]
                             ->load(memory_order_acquire)
@@ -485,10 +532,10 @@ public:
     static constexpr unsigned INITIAL_DEPTH = 2;
 
 private:
-    size_t get_prefix(size_t key, unsigned depth) const
+    size_t get_prefix(HashType key, unsigned depth) const
     {
-        assert(depth < sizeof(size_t) * 8 && "depth is bigger than bit-wise size of a key");
-        return (key >> (sizeof(size_t) * 8 - depth));
+        assert(depth < sizeof(HashType) * 8 && "depth is bigger than bit-wise size of a key");
+        return (key >> (sizeof(HashType) * 8 - depth));
     }
 
     int get_tid() const
@@ -499,6 +546,11 @@ private:
     atomic<DState *> table;
     vector<Operation *> help;
     vector<size_t> op_seq_nums;
+    vector<vector<DState*>> dstates_retired;
+    vector<vector<Bucket*>> buckets_retired;
+    vector<vector<BState*>> bstates_retired;
+    vector<uint64_t> thread_epochs;
+    atomic_uint64_t global_epoch;
 
     const unsigned thread_num;
 };

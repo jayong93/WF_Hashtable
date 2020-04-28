@@ -6,6 +6,18 @@
 using namespace std;
 using namespace chrono;
 
+struct Hasher
+{
+    typedef unsigned int Output;
+    Output operator()(unsigned int x) const
+    {
+        x = ((x >> 16) ^ x) * 0x45d9f3b;
+        x = ((x >> 16) ^ x) * 0x45d9f3b;
+        x = (x >> 16) ^ x;
+        return x;
+    }
+};
+
 unsigned long fastrand(void)
 { //period 2^96-1
     static thread_local unsigned long x = 123456789, y = 362436069, z = 521288629;
@@ -25,7 +37,7 @@ unsigned long fastrand(void)
 constexpr unsigned NUM_TEST = 4'000'000;
 constexpr unsigned RANGE = 1'000;
 
-using HashTable = WF_HashTable<unsigned, unsigned>;
+using HashTable = WF_HashTable<unsigned, unsigned, Hasher, Hasher::Output>;
 
 void benchmark(unsigned num_thread, HashTable *table)
 {
@@ -54,8 +66,11 @@ void benchmark(unsigned num_thread, HashTable *table)
     }
 }
 
-int main(int argc, char* argv[])
+int main(int argc, char *argv[])
 {
+    // cout << boolalpha << ((0b0110110 >> (7 - 4)) == 0b0110) << endl;
+    // cout << boolalpha << ((0b0110110 >> (7 - 2)) == 0b01) << endl;
+    // cout << boolalpha << ((0b110110 >> (6 - 3)) == 0b110) << endl;
     for (unsigned num_thread = 1; num_thread <= 32; num_thread *= 2)
     {
         HashTable table{num_thread};
