@@ -18,6 +18,21 @@ static thread_local int thread_id = id_counter.fetch_add(1, memory_order_relaxed
 
 static constexpr unsigned BSTATE_ITEM_NUM = 4;
 
+template<typename T>
+struct CopyableAtomic {
+	atomic<T> value;
+
+	CopyableAtomic<T>() : value{ nullptr } {}
+	CopyableAtomic<T>(const T& val) : value{ val } {}
+	CopyableAtomic<T>(const CopyableAtomic<T>& other) : value{ other.value.load(memory_order_relaxed) } {}
+	CopyableAtomic<T>& operator=(const CopyableAtomic<T>& other) {
+		value.store(other.value.load(memory_order_relaxed), memory_order_relaxed);
+	}
+	atomic<T>& operator*() { return value; }
+	atomic<T>* operator->() { return &value; }
+};
+
+
 template <typename Key, typename Value, typename Hasher, typename HashType>
 class WF_HashTable
 {
@@ -171,21 +186,10 @@ class WF_HashTable
 		}
 	};
 
-	template<typename T>
-	struct CopyableAtomic {
-		atomic<T*> value;
-
-		CopyableAtomic<T>() : value{ nullptr } {}
-		CopyableAtomic<T>(T* ptr) : value{ ptr } {}
-		CopyableAtomic<T>(const CopyableAtomic<T>& other) : value{ other.value.load(memory_order_relaxed) } {}
-		atomic<T*>& operator*() { return value; }
-		atomic<T*>* operator->() { return &value; }
-	};
-
 	struct DState
 	{
 		unsigned depth;
-		vector<CopyableAtomic<Bucket>> dir;
+		vector<CopyableAtomic<Bucket*>> dir;
 
 		explicit DState(unsigned depth, unsigned thread_num) : depth{ depth }, dir{ (1u << depth), nullptr }
 		{
@@ -209,7 +213,7 @@ class WF_HashTable
 		{
 			if (new_depth <= depth)
 				return;
-			vector<CopyableAtomic<Bucket>> new_dir{ (1u << new_depth) };
+			vector<CopyableAtomic<Bucket*>> new_dir{ (1u << new_depth) };
 			for (auto i = 0; i < (1 << new_depth); ++i)
 			{
 				for (auto entry : dir)
@@ -233,12 +237,12 @@ class WF_HashTable
 	};
 
 public:
-	WF_HashTable<Key, Value, Hasher, HashType>(unsigned thread_num) : thread_num{ thread_num }, help{ thread_num }, op_seq_nums{ thread_num, 0 }, table{ new DState{INITIAL_DEPTH, thread_num} }, global_epoch{ 0 }
+	WF_HashTable<Key, Value, Hasher, HashType>(unsigned thread_num) : thread_num{ thread_num }, help{ thread_num }, op_seq_nums{ thread_num, 0 }, table{ new DState{INITIAL_DEPTH, thread_num} }, thread_epochs{ thread_num, 0 }, global_epoch{ 0 }
 	{
-		for (auto i = 0; i < thread_num; ++i)
-		{
-			thread_epochs.emplace_back(new atomic_uint64_t{ 0 });
-		}
+		//for (auto i = 0; i < thread_num; ++i)
+		//{
+		//	thread_epochs.emplace_back(new atomic_uint64_t{ 0 });
+		//}
 	}
 
 	//~WF_HashTable<Key, Value, Hasher, HashType>()
@@ -474,23 +478,24 @@ public:
 	{
 		for (auto i = 0; i < 2; ++i)
 		{
-			vector<Bucket*> retired_buckets;
+			//vector<Bucket*> retired_buckets;
 			DState* old_table = table.load(memory_order_relaxed);
 			DState* new_table = new DState{ *old_table };
 
 			for (auto i = 0; i < help.size(); ++i)
 			{
-				auto buckets = update_new_table(*new_table, i);
-				retired_buckets.insert(retired_buckets.end(), buckets.begin(), buckets.end());
+				update_new_table(*new_table, i);
+				//auto buckets = update_new_table(*new_table, i);
+				//retired_buckets.insert(retired_buckets.end(), buckets.begin(), buckets.end());
 			}
 
 			if (true == table.compare_exchange_strong(old_table, new_table))
 			{
-				for (auto bucket : retired_buckets)
-				{
-					retire(bucket);
-				}
-				retire(old_table);
+				//for (auto bucket : retired_buckets)
+				//{
+				//	retire(bucket);
+				//}
+				//retire(old_table);
 				break;
 			}
 		}
@@ -615,19 +620,19 @@ private:
 	};
 
 	struct RetiredList {
-		vector<EpochNode<DState>> dstates;
-		vector<EpochNode<Bucket>> buckets;
-		vector<EpochNode<BState>> bstates;
+		//vector<EpochNode<DState>> dstates;
+		//vector<EpochNode<Bucket>> buckets;
+		//vector<EpochNode<BState>> bstates;
 
 		RetiredList() = default;
 		RetiredList(const RetiredList&) = delete;
 		RetiredList& operator=(const RetiredList&) = delete;
-		RetiredList(RetiredList&& other) : dstates{ move(other.dstates) }, buckets{ move(other.buckets) }, bstates{ move(other.bstates) } {}
-		RetiredList& operator=(RetiredList&& other) {
-			dstates = move(other.dstates);
-			buckets = move(other.buckets);
-			bstates = move(other.bstates);
-		}
+		//RetiredList(RetiredList&& other) : dstates{ move(other.dstates) }, buckets{ move(other.buckets) }, bstates{ move(other.bstates) } {}
+		//RetiredList& operator=(RetiredList&& other) {
+		//	dstates = move(other.dstates);
+		//	buckets = move(other.buckets);
+		//	bstates = move(other.bstates);
+		//}
 	};
 
 	void start_op()
@@ -640,36 +645,36 @@ private:
 		auto tid = get_tid();
 		thread_epochs[tid]->store(UINT64_MAX, memory_order_release);
 	}
-	void retire_(DState* ptr, uint64_t epoch)
-	{
-		//retired_lists[tid].dstates.emplace_back(ptr, epoch);
-	}
-	void retire_(Bucket* ptr, uint64_t epoch)
-	{
-		retired_list.buckets.emplace_back(ptr, epoch);
-	}
-	void retire_(BState* ptr, uint64_t epoch)
-	{
-		retired_list.bstates.emplace_back(ptr, epoch);
-	}
-	void empty()
-	{
-		auto min_epoch = UINT64_MAX;
-		for (auto epoch : thread_epochs)
-		{
-			auto e = epoch->load(memory_order_acquire);
-			if (e < min_epoch)
-			{
-				min_epoch = e;
-			}
-		}
+	//void retire_(DState* ptr, uint64_t epoch)
+	//{
+	//	//retired_lists[tid].dstates.emplace_back(ptr, epoch);
+	//}
+	//void retire_(Bucket* ptr, uint64_t epoch)
+	//{
+	//	retired_list.buckets.emplace_back(ptr, epoch);
+	//}
+	//void retire_(BState* ptr, uint64_t epoch)
+	//{
+	//	retired_list.bstates.emplace_back(ptr, epoch);
+	//}
+	//void empty()
+	//{
+	//	auto min_epoch = UINT64_MAX;
+	//	for (auto epoch : thread_epochs)
+	//	{
+	//		auto e = epoch->load(memory_order_acquire);
+	//		if (e < min_epoch)
+	//		{
+	//			min_epoch = e;
+	//		}
+	//	}
 
-		RetiredList& r_list = retired_list;
+	//	RetiredList& r_list = retired_list;
 
-		remove_retired(r_list.dstates, min_epoch);
-		remove_retired(r_list.buckets, min_epoch);
-		remove_retired(r_list.bstates, min_epoch);
-	}
+	//	remove_retired(r_list.dstates, min_epoch);
+	//	remove_retired(r_list.buckets, min_epoch);
+	//	remove_retired(r_list.bstates, min_epoch);
+	//}
 	template <typename T>
 	void remove_retired(vector<EpochNode<T>>& list, uint64_t min_epoch)
 	{
@@ -687,13 +692,13 @@ private:
 	template <typename T>
 	void retire(T* ptr)
 	{
-		retire_(ptr, global_epoch.load(memory_order_relaxed));
-		auto& counter = thread_counter;
-		counter++;
-		if (counter % EPOCH_INCREASE_RATE == 0)
-			global_epoch.fetch_add(1, memory_order_relaxed);
-		if (counter % EMPTY_RATE == 0)
-			empty();
+		//retire_(ptr, global_epoch.load(memory_order_relaxed));
+		//auto& counter = thread_counter;
+		//counter++;
+		//if (counter % EPOCH_INCREASE_RATE == 0)
+		//	global_epoch.fetch_add(1, memory_order_relaxed);
+		//if (counter % EMPTY_RATE == 0)
+		//	empty();
 	}
 
 	atomic<DState*> table;
@@ -702,7 +707,7 @@ private:
 
 	static thread_local RetiredList retired_list;
 	static thread_local uint64_t thread_counter;
-	vector<atomic_uint64_t*> thread_epochs;
+	vector<CopyableAtomic<uint64_t>> thread_epochs;
 	atomic_uint64_t global_epoch;
 
 	static constexpr uint64_t EPOCH_INCREASE_RATE = 50;
