@@ -221,7 +221,7 @@ class WF_HashTable
 						new_dir[i]->store(bucket, memory_order_relaxed);
 						break;
 					}
-					else if (bucket->prefix < dir_prefix) {
+					else if (dir_prefix < bucket->prefix) {
 						break;
 					}
 				}
@@ -233,7 +233,7 @@ class WF_HashTable
 	};
 
 public:
-	WF_HashTable<Key, Value, Hasher, HashType>(unsigned thread_num) : thread_num{ thread_num }, help{ thread_num }, op_seq_nums{ thread_num, 0 }, table{ new DState{INITIAL_DEPTH, thread_num} }, retired_lists{ thread_num }, thread_counter{ thread_num, 0 }, global_epoch{ 0 }
+	WF_HashTable<Key, Value, Hasher, HashType>(unsigned thread_num) : thread_num{ thread_num }, help{ thread_num }, op_seq_nums{ thread_num, 0 }, table{ new DState{INITIAL_DEPTH, thread_num} }, global_epoch{ 0 }
 	{
 		for (auto i = 0; i < thread_num; ++i)
 		{
@@ -241,8 +241,8 @@ public:
 		}
 	}
 
-	~WF_HashTable<Key, Value, Hasher, HashType>()
-	{
+	//~WF_HashTable<Key, Value, Hasher, HashType>()
+	//{
 		// DState *l_table = table.load(memory_order_acquire);
 		// Bucket *prev_bucket = nullptr;
 		// for (auto entry : l_table->dir)
@@ -289,7 +289,7 @@ public:
 		// {
 		//     delete p_epoch;
 		// }
-	}
+	//}
 
 	void announce(OP op, HashType key, const Value& value, size_t seq_num)
 	{
@@ -618,6 +618,16 @@ private:
 		vector<EpochNode<DState>> dstates;
 		vector<EpochNode<Bucket>> buckets;
 		vector<EpochNode<BState>> bstates;
+
+		RetiredList() = default;
+		RetiredList(const RetiredList&) = delete;
+		RetiredList& operator=(const RetiredList&) = delete;
+		RetiredList(RetiredList&& other) : dstates{ move(other.dstates) }, buckets{ move(other.buckets) }, bstates{ move(other.bstates) } {}
+		RetiredList& operator=(RetiredList&& other) {
+			dstates = move(other.dstates);
+			buckets = move(other.buckets);
+			bstates = move(other.bstates);
+		}
 	};
 
 	void start_op()
@@ -630,19 +640,19 @@ private:
 		auto tid = get_tid();
 		thread_epochs[tid]->store(UINT64_MAX, memory_order_release);
 	}
-	void retire_(int tid, DState* ptr, uint64_t epoch)
+	void retire_(DState* ptr, uint64_t epoch)
 	{
-		retired_lists[tid].dstates.emplace_back(ptr, epoch);
+		//retired_lists[tid].dstates.emplace_back(ptr, epoch);
 	}
-	void retire_(int tid, Bucket* ptr, uint64_t epoch)
+	void retire_(Bucket* ptr, uint64_t epoch)
 	{
-		retired_lists[tid].buckets.emplace_back(ptr, epoch);
+		retired_list.buckets.emplace_back(ptr, epoch);
 	}
-	void retire_(int tid, BState* ptr, uint64_t epoch)
+	void retire_(BState* ptr, uint64_t epoch)
 	{
-		retired_lists[tid].bstates.emplace_back(ptr, epoch);
+		retired_list.bstates.emplace_back(ptr, epoch);
 	}
-	void empty(int tid)
+	void empty()
 	{
 		auto min_epoch = UINT64_MAX;
 		for (auto epoch : thread_epochs)
@@ -654,7 +664,7 @@ private:
 			}
 		}
 
-		RetiredList& r_list = retired_lists[tid];
+		RetiredList& r_list = retired_list;
 
 		remove_retired(r_list.dstates, min_epoch);
 		remove_retired(r_list.buckets, min_epoch);
@@ -677,26 +687,31 @@ private:
 	template <typename T>
 	void retire(T* ptr)
 	{
-		auto tid = get_tid();
-		retire_(tid, ptr, global_epoch.load(memory_order_relaxed));
-		auto& counter = thread_counter[tid];
+		retire_(ptr, global_epoch.load(memory_order_relaxed));
+		auto& counter = thread_counter;
 		counter++;
 		if (counter % EPOCH_INCREASE_RATE == 0)
 			global_epoch.fetch_add(1, memory_order_relaxed);
 		if (counter % EMPTY_RATE == 0)
-			empty(tid);
+			empty();
 	}
 
 	atomic<DState*> table;
 	vector<Operation*> help;
 	vector<size_t> op_seq_nums;
 
-	vector<RetiredList> retired_lists;
+	static thread_local RetiredList retired_list;
+	static thread_local uint64_t thread_counter;
 	vector<atomic_uint64_t*> thread_epochs;
-	vector<uint64_t> thread_counter;
 	atomic_uint64_t global_epoch;
 
 	static constexpr uint64_t EPOCH_INCREASE_RATE = 50;
 	static constexpr uint64_t EMPTY_RATE = 100;
 	const unsigned thread_num;
 };
+
+template <typename Key, typename Value, typename Hasher, typename HashType>
+thread_local typename WF_HashTable<Key, Value, Hasher, HashType>::RetiredList WF_HashTable<Key, Value, Hasher, HashType>::retired_list;
+
+template <typename Key, typename Value, typename Hasher, typename HashType>
+thread_local uint64_t WF_HashTable<Key, Value, Hasher, HashType>::thread_counter = 0;
