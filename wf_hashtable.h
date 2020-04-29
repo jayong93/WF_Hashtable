@@ -233,14 +233,13 @@ class WF_HashTable
     };
 
 public:
-    WF_HashTable<Key, Value, Hasher, HashType>(unsigned thread_num) : thread_num{thread_num}, help{thread_num}, op_seq_nums{thread_num, 0}, table{new DState{INITIAL_DEPTH, thread_num}}, global_epoch{0}
+    WF_HashTable<Key, Value, Hasher, HashType>(unsigned thread_num) : thread_num{ thread_num }, help{ thread_num }, op_seq_nums{ thread_num, 0 }, table{ new DState{INITIAL_DEPTH, thread_num} }, dstates_retired{}, buckets_retired{}, bstates_retired{}, thread_counter{ thread_num, 0 }, global_epoch{ 0 }
     {
         for (auto i=0; i<thread_num; ++i)
         {
             dstates_retired.emplace_back();
             buckets_retired.emplace_back();
             bstates_retired.emplace_back();
-            thread_counter.emplace_back(0);
             thread_epochs.emplace_back(new atomic_uint64_t{0});
         }
     }
@@ -527,7 +526,7 @@ public:
         resize_if_needed(hash_key, seq_num);
 
         auto local_table = table.load(memory_order_acquire);
-        auto status = local_table->dir[get_prefix(hash_key, local_table->depth)]->load(memory_order_release)->state.load(memory_order_release)->results[tid].status;
+        auto status = local_table->dir[get_prefix(hash_key, local_table->depth)]->load(memory_order_relaxed)->state.load(memory_order_relaxed)->results[tid].status;
         end_op();
         return status;
     }
@@ -547,7 +546,7 @@ public:
         resize_if_needed(hash_key, seq_num);
 
         auto local_table = table.load(memory_order_acquire);
-        auto status = local_table->dir[get_prefix(hash_key, local_table->depth)]->load(memory_order_release)->state.load(memory_order_release)->results[tid].status;
+        auto status = local_table->dir[get_prefix(hash_key, local_table->depth)]->load(memory_order_relaxed)->state.load(memory_order_relaxed)->results[tid].status;
         end_op();
         return status;
     }
@@ -613,8 +612,9 @@ private:
         T *ptr;
         uint64_t retired_epoch;
 
-        EpochNode() : ptr{nullptr}, retired_epoch{0} {}
-        EpochNode(T *ptr, uint64_t epoch) : ptr{ptr}, retired_epoch{epoch} {}
+        EpochNode<T>() : ptr{nullptr}, retired_epoch{0} {}
+        EpochNode<T>(T *ptr, uint64_t epoch) : ptr{ptr}, retired_epoch{epoch} {}
+        EpochNode<T>(const EpochNode<T>& other) : ptr{ other.ptr }, retired_epoch{ other.retired_epoch } {}
     };
     void start_op()
     {

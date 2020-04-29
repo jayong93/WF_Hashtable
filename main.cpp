@@ -18,10 +18,10 @@ struct Hasher
     }
 };
 
-unsigned int fastrand(void)
+unsigned long long fastrand(void)
 { //period 2^96-1
-    static thread_local unsigned int x = 123456789, y = 362436069, z = 521288629;
-    unsigned int t;
+    static thread_local unsigned long long x = 123456789, y = 362436069, z = 521288629;
+    unsigned long long t;
     x ^= x << 16;
     x ^= x >> 5;
     x ^= x << 1;
@@ -34,13 +34,16 @@ unsigned int fastrand(void)
     return z;
 }
 
-constexpr unsigned NUM_TEST = 4'000'000;
+constexpr unsigned NUM_TEST = 100'000;
 constexpr unsigned RANGE = 1'000;
 
 using HashTable = WF_HashTable<unsigned, unsigned, Hasher, Hasher::Output>;
 
-void benchmark(unsigned num_thread, HashTable *table)
+unique_ptr<HashTable> g_table;
+
+void benchmark(unsigned num_thread)
 {
+    HashTable* table = g_table.get();
     for (int i = 0; i < NUM_TEST / num_thread; ++i)
     {
         //	if (0 == i % 100000) cout << ".";
@@ -70,17 +73,17 @@ int main(int argc, char *argv[])
 {
     for (unsigned num_thread = 1; num_thread <= 32; num_thread *= 2)
     {
-        HashTable table{num_thread};
+        g_table = make_unique<HashTable>(num_thread);
 
         vector<thread> worker;
         auto start_t = high_resolution_clock::now();
         for (unsigned i = 0; i < num_thread; ++i)
-            worker.emplace_back(benchmark, num_thread, &table);
+            worker.emplace_back(benchmark, num_thread);
         for (auto &th : worker)
             th.join();
         auto du = high_resolution_clock::now() - start_t;
 
-        table.dump();
+        //table.dump();
 
         printf("%ld Threads, Time=%lld ms\n", num_thread, duration_cast<milliseconds>(du).count());
         fflush(NULL);
