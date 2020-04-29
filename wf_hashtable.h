@@ -14,7 +14,7 @@
 using namespace std;
 
 static atomic_uint id_counter{ 0 };
-static thread_local int thread_id = id_counter.fetch_add(1, memory_order_relaxed);
+static thread_local int thread_id = id_counter.fetch_add(1, memory_order_seq_cst);
 
 static constexpr unsigned BSTATE_ITEM_NUM = 4;
 
@@ -24,9 +24,9 @@ struct CopyableAtomic {
 
 	CopyableAtomic<T>() : value{ nullptr } {}
 	CopyableAtomic<T>(const T& val) : value{ val } {}
-	CopyableAtomic<T>(const CopyableAtomic<T>& other) : value{ other.value.load(memory_order_relaxed) } {}
+	CopyableAtomic<T>(const CopyableAtomic<T>& other) : value{ other.value.load(memory_order_seq_cst) } {}
 	CopyableAtomic<T>& operator=(const CopyableAtomic<T>& other) {
-		value.store(other.value.load(memory_order_relaxed), memory_order_relaxed);
+		value.store(other.value.load(memory_order_seq_cst), memory_order_seq_cst);
 	}
 	atomic<T>& operator*() { return value; }
 	atomic<T>* operator->() { return &value; }
@@ -167,10 +167,10 @@ class WF_HashTable
 				toggle.emplace_back(false);
 			}
 		}
-		Bucket(const Bucket& other) : prefix{ other.prefix }, depth{ other.depth }, state{ other.state.load(memory_order_acquire) }, toggle{ other.toggle } {}
+		Bucket(const Bucket& other) : prefix{ other.prefix }, depth{ other.depth }, state{ other.state.load(memory_order_seq_cst) }, toggle{ other.toggle } {}
 		~Bucket()
 		{
-			auto s = state.load(memory_order_relaxed);
+			auto s = state.load(memory_order_seq_cst);
 			if (s != nullptr)
 			{
 				delete s;
@@ -181,7 +181,7 @@ class WF_HashTable
 		{
 			prefix = other.prefix;
 			depth = other.depth;
-			state = other.state.load(memory_order_acquire);
+			state = other.state.load(memory_order_seq_cst);
 			toggle = other.toggle;
 		}
 	};
@@ -198,14 +198,14 @@ class WF_HashTable
 			bucket->prefix = 0;
 			for (i = 0; i < (1 << (depth - 1)); ++i)
 			{
-				dir[i]->store(bucket, memory_order_relaxed);
+				dir[i]->store(bucket, memory_order_seq_cst);
 			}
 
 			bucket = new Bucket{ 1u, thread_num };
 			bucket->prefix = 1;
 			for (; i < (1 << depth); ++i)
 			{
-				dir[i]->store(bucket, memory_order_relaxed);
+				dir[i]->store(bucket, memory_order_seq_cst);
 			}
 		}
 
@@ -218,11 +218,11 @@ class WF_HashTable
 			{
 				for (auto entry : dir)
 				{
-					Bucket* bucket = entry->load(memory_order_relaxed);
+					Bucket* bucket = entry->load(memory_order_seq_cst);
 					const auto dir_prefix = (i >> (new_depth - bucket->depth));
 					if (bucket->prefix == dir_prefix)
 					{
-						new_dir[i]->store(bucket, memory_order_relaxed);
+						new_dir[i]->store(bucket, memory_order_seq_cst);
 						break;
 					}
 					else if (dir_prefix < bucket->prefix) {
@@ -247,11 +247,11 @@ public:
 
 	//~WF_HashTable<Key, Value, Hasher, HashType>()
 	//{
-		// DState *l_table = table.load(memory_order_acquire);
+		// DState *l_table = table.load(memory_order_seq_cst);
 		// Bucket *prev_bucket = nullptr;
 		// for (auto entry : l_table->dir)
 		// {
-		//     Bucket *bucket = entry->load(memory_order_acquire);
+		//     Bucket *bucket = entry->load(memory_order_seq_cst);
 		//     if (prev_bucket == bucket)
 		//     {
 		//         continue;
@@ -317,7 +317,7 @@ public:
 
 	bool update_bucket(Bucket* bucket)
 	{
-		auto old_bstate = bucket->state.load(memory_order_acquire);
+		auto old_bstate = bucket->state.load(memory_order_seq_cst);
 		auto new_bstate = new BState{ *old_bstate };
 		auto toggle = bucket->toggle;
 
@@ -351,8 +351,8 @@ public:
 
 	void apply_op(HashType key)
 	{
-		DState* local_table = table.load(memory_order_acquire);
-		Bucket* bucket = local_table->dir[get_prefix(key, local_table->depth)]->load(memory_order_acquire);
+		DState* local_table = table.load(memory_order_seq_cst);
+		Bucket* bucket = local_table->dir[get_prefix(key, local_table->depth)]->load(memory_order_seq_cst);
 		// 현재 thread가 이 bucket에 update를 시도한다는 것을 알림
 		// 충돌하는 다른 thread들은 이걸 보고 도와줌
 		auto toggle = bucket->toggle[get_tid()];
@@ -367,19 +367,19 @@ public:
 
 	pair<Bucket*, Bucket*> split_bucket(const Bucket& from)
 	{
-		const BState& org_state = *(from.state.load(memory_order_acquire));
+		const BState& org_state = *(from.state.load(memory_order_seq_cst));
 		Bucket* new_b1 = new Bucket{ from };
 		new_b1->depth = from.depth + 1;
 		new_b1->prefix = from.prefix << 1;
 		BState* b1_state = new BState{ (unsigned)org_state.applied.size() };
 		b1_state->results = org_state.results;
 		b1_state->applied = new_b1->toggle;
-		new_b1->state.store(b1_state, memory_order_release);
+		new_b1->state.store(b1_state, memory_order_seq_cst);
 
 		Bucket* new_b2 = new Bucket{ *new_b1 };
 		new_b2->prefix = new_b1->prefix + 1;
 		BState* b2_state = new BState{ *b1_state };
-		new_b2->state.store(b2_state, memory_order_release);
+		new_b2->state.store(b2_state, memory_order_seq_cst);
 
 		for (auto& item : org_state.items)
 		{
@@ -421,7 +421,7 @@ public:
 				auto entry_prefix = i >> (table.depth - b->depth);
 				if (entry_prefix == b->prefix)
 				{
-					table.dir[i]->store(b, memory_order_relaxed);
+					table.dir[i]->store(b, memory_order_seq_cst);
 				}
 				else if (b->prefix < entry_prefix)
 					break;
@@ -439,19 +439,19 @@ public:
 			const Operation& op = *help[i];
 			if (get_prefix(op.key, bucket_full.depth) != bucket_full.prefix)
 				continue;
-			const BState& state = *bucket_full.state.load(memory_order_relaxed);
+			const BState& state = *bucket_full.state.load(memory_order_seq_cst);
 			if (state.results[i].seq_num >= op.seq_num)
 				continue;
 
-			Bucket* dest = table.dir[get_prefix(op.key, table.depth)]->load(memory_order_relaxed);
-			BState* dest_state = dest->state.load(memory_order_relaxed);
+			Bucket* dest = table.dir[get_prefix(op.key, table.depth)]->load(memory_order_seq_cst);
+			BState* dest_state = dest->state.load(memory_order_seq_cst);
 			while (dest_state->is_full())
 			{
 				auto [new_buck1, new_buck2] = split_bucket(*dest);
 				update_directory(table, *new_buck1, *new_buck2);
 				retired_buckets.emplace_back(dest);
-				dest = table.dir[get_prefix(op.key, table.depth)]->load(memory_order_relaxed);
-				dest_state = dest->state.load(memory_order_relaxed);
+				dest = table.dir[get_prefix(op.key, table.depth)]->load(memory_order_seq_cst);
+				dest_state = dest->state.load(memory_order_seq_cst);
 			}
 			dest_state->results[i].status = exec_on_bucket(dest_state, op);
 			dest_state->results[i].seq_num = op.seq_num;
@@ -465,8 +465,8 @@ public:
 		if (help[thread_id] == nullptr)
 			return retired_buckets;
 		const Operation& op = *help[thread_id];
-		Bucket* bucket = table.dir[get_prefix(op.key, table.depth)]->load(memory_order_relaxed);
-		BState* state = bucket->state.load(memory_order_relaxed);
+		Bucket* bucket = table.dir[get_prefix(op.key, table.depth)]->load(memory_order_seq_cst);
+		BState* state = bucket->state.load(memory_order_seq_cst);
 		if (state->is_full() && state->results[thread_id].seq_num < op.seq_num)
 		{
 			retired_buckets = apply_pending_resize(table, *bucket);
@@ -479,7 +479,7 @@ public:
 		for (auto i = 0; i < 2; ++i)
 		{
 			//vector<Bucket*> retired_buckets;
-			DState* old_table = table.load(memory_order_relaxed);
+			DState* old_table = table.load(memory_order_seq_cst);
 			DState* new_table = new DState{ *old_table };
 
 			for (auto i = 0; i < help.size(); ++i)
@@ -503,9 +503,9 @@ public:
 
 	void resize_if_needed(HashType key, size_t seq_num)
 	{
-		DState* local_table = table.load(memory_order_acquire);
-		Bucket* bucket = local_table->dir[get_prefix(key, local_table->depth)]->load(memory_order_acquire);
-		BState* state = bucket->state.load(memory_order_acquire);
+		DState* local_table = table.load(memory_order_seq_cst);
+		Bucket* bucket = local_table->dir[get_prefix(key, local_table->depth)]->load(memory_order_seq_cst);
+		BState* state = bucket->state.load(memory_order_seq_cst);
 
 		if (state->results[get_tid()].seq_num != seq_num)
 		{
@@ -527,8 +527,8 @@ public:
 		// Resize가 필요하면 Resize
 		resize_if_needed(hash_key, seq_num);
 
-		auto local_table = table.load(memory_order_acquire);
-		auto status = local_table->dir[get_prefix(hash_key, local_table->depth)]->load(memory_order_relaxed)->state.load(memory_order_relaxed)->results[tid].status;
+		auto local_table = table.load(memory_order_seq_cst);
+		auto status = local_table->dir[get_prefix(hash_key, local_table->depth)]->load(memory_order_seq_cst)->state.load(memory_order_seq_cst)->results[tid].status;
 		end_op();
 		return status;
 	}
@@ -547,8 +547,8 @@ public:
 		// Resize가 필요하면 Resize
 		resize_if_needed(hash_key, seq_num);
 
-		auto local_table = table.load(memory_order_acquire);
-		auto status = local_table->dir[get_prefix(hash_key, local_table->depth)]->load(memory_order_relaxed)->state.load(memory_order_relaxed)->results[tid].status;
+		auto local_table = table.load(memory_order_seq_cst);
+		auto status = local_table->dir[get_prefix(hash_key, local_table->depth)]->load(memory_order_seq_cst)->state.load(memory_order_seq_cst)->results[tid].status;
 		end_op();
 		return status;
 	}
@@ -557,10 +557,10 @@ public:
 	{
 		start_op();
 		HashType hash_key = Hasher{}(key);
-		DState* local_table = table.load(memory_order_acquire);
+		DState* local_table = table.load(memory_order_seq_cst);
 		BState* state = local_table->dir[get_prefix(hash_key, local_table->depth)]
-			->load(memory_order_acquire)
-			->state.load(memory_order_acquire);
+			->load(memory_order_seq_cst)
+			->state.load(memory_order_seq_cst);
 
 		auto it = find_if(state->items.begin(), state->items.end(), [hash_key](auto& item) {
 			return item && item->first == hash_key;
@@ -577,12 +577,12 @@ public:
 
 	void dump()
 	{
-		DState* local_table = table.load(memory_order_acquire);
+		DState* local_table = table.load(memory_order_seq_cst);
 		printf("Dump(<HashKey, Value>):\n");
 		for (const auto& dir_entry : local_table->dir)
 		{
-			Bucket* bucket = dir_entry->load(memory_order_relaxed);
-			BState* state = bucket->state.load(memory_order_relaxed);
+			Bucket* bucket = dir_entry->load(memory_order_seq_cst);
+			BState* state = bucket->state.load(memory_order_seq_cst);
 			for (const auto& item : state->items)
 			{
 				if (item)
@@ -638,12 +638,12 @@ private:
 	void start_op()
 	{
 		auto tid = get_tid();
-		thread_epochs[tid]->store(global_epoch.load(memory_order_relaxed), memory_order_release);
+		thread_epochs[tid]->store(global_epoch.load(memory_order_seq_cst), memory_order_seq_cst);
 	}
 	void end_op()
 	{
 		auto tid = get_tid();
-		thread_epochs[tid]->store(UINT64_MAX, memory_order_release);
+		thread_epochs[tid]->store(UINT64_MAX, memory_order_seq_cst);
 	}
 	//void retire_(DState* ptr, uint64_t epoch)
 	//{
@@ -662,7 +662,7 @@ private:
 	//	auto min_epoch = UINT64_MAX;
 	//	for (auto epoch : thread_epochs)
 	//	{
-	//		auto e = epoch->load(memory_order_acquire);
+	//		auto e = epoch->load(memory_order_seq_cst);
 	//		if (e < min_epoch)
 	//		{
 	//			min_epoch = e;
@@ -692,11 +692,11 @@ private:
 	template <typename T>
 	void retire(T* ptr)
 	{
-		//retire_(ptr, global_epoch.load(memory_order_relaxed));
+		//retire_(ptr, global_epoch.load(memory_order_seq_cst));
 		//auto& counter = thread_counter;
 		//counter++;
 		//if (counter % EPOCH_INCREASE_RATE == 0)
-		//	global_epoch.fetch_add(1, memory_order_relaxed);
+		//	global_epoch.fetch_add(1, memory_order_seq_cst);
 		//if (counter % EMPTY_RATE == 0)
 		//	empty();
 	}
