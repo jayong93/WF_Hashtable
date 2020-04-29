@@ -18,10 +18,10 @@ struct Hasher
     }
 };
 
-unsigned long fastrand(void)
+unsigned int fastrand(void)
 { //period 2^96-1
-    static thread_local unsigned long x = 123456789, y = 362436069, z = 521288629;
-    unsigned long t;
+    static thread_local unsigned int x = 123456789, y = 362436069, z = 521288629;
+    unsigned int t;
     x ^= x << 16;
     x ^= x >> 5;
     x ^= x << 1;
@@ -68,9 +68,6 @@ void benchmark(unsigned num_thread, HashTable *table)
 
 int main(int argc, char *argv[])
 {
-    // cout << boolalpha << ((0b0110110 >> (7 - 4)) == 0b0110) << endl;
-    // cout << boolalpha << ((0b0110110 >> (7 - 2)) == 0b01) << endl;
-    // cout << boolalpha << ((0b110110 >> (6 - 3)) == 0b110) << endl;
     for (unsigned num_thread = 1; num_thread <= 32; num_thread *= 2)
     {
         HashTable table{num_thread};
@@ -85,7 +82,7 @@ int main(int argc, char *argv[])
 
         table.dump();
 
-        printf("%d Threads, Time=%ld ms\n", num_thread, duration_cast<milliseconds>(du).count());
+        printf("%ld Threads, Time=%lld ms\n", num_thread, duration_cast<milliseconds>(du).count());
         fflush(NULL);
     }
 }

@@ -9,6 +9,7 @@
 #include <functional>
 #include <iostream>
 #include <unordered_set>
+#include <array>
 
 using namespace std;
 
@@ -29,7 +30,7 @@ class WF_HashTable
     struct Operation
     {
         OP op;
-        size_t key;
+        HashType key;
         Value value;
         size_t seq_num;
     };
@@ -50,7 +51,7 @@ class WF_HashTable
     struct BState
     {
         using Status = typename Result::Status;
-        array<optional<pair<size_t, Value>>, BSTATE_ITEM_NUM> items;
+        array<optional<pair<HashType, Value>>, BSTATE_ITEM_NUM> items;
         vector<bool> applied;
         vector<Result> results;
 
@@ -65,7 +66,7 @@ class WF_HashTable
             }
         }
 
-        Status insert(size_t key, const Value &val)
+        Status insert(HashType key, const Value &val)
         {
             // key가 없을거라고 가정하고 시작
             // insert는 key가 없어야 성공이므로 true로 초기화
@@ -90,7 +91,7 @@ class WF_HashTable
             return status;
         }
 
-        Status remove(size_t key)
+        Status remove(HashType key)
         {
             // key가 없을거라고 가정
             // remove는 key가 있어야 성공이므로 false로 초기화
@@ -111,7 +112,7 @@ class WF_HashTable
 
         bool is_full() const
         {
-            return all_of(items.begin(), items.end(), [](const optional<pair<size_t, Value>> &item) { return bool(item); });
+            return all_of(items.begin(), items.end(), [](const optional<pair<HashType, Value>> &item) { return bool(item); });
         }
 
     private:
@@ -178,7 +179,7 @@ class WF_HashTable
         DState(unsigned depth, unsigned thread_num) : depth{depth}, dir{(1u << depth), nullptr}
         {
             unsigned i;
-            for (i = 0; i < (1 << depth - 1); ++i)
+            for (i = 0; i < (1 << (depth - 1)); ++i)
             {
                 Bucket *bucket = new Bucket{1, thread_num};
                 bucket->prefix = 0;
@@ -294,7 +295,7 @@ public:
         // }
     }
 
-    void announce(OP op, size_t key, const Value &value, size_t seq_num)
+    void announce(OP op, HashType key, const Value &value, size_t seq_num)
     {
         help[get_tid()] = new Operation{op, key, value, seq_num};
     }
@@ -499,7 +500,7 @@ public:
         }
     }
 
-    void resize_if_needed(HashType key, HashType seq_num)
+    void resize_if_needed(HashType key, size_t seq_num)
     {
         DState *local_table = table.load(memory_order_acquire);
         Bucket *bucket = local_table->dir[get_prefix(key, local_table->depth)]->load(memory_order_acquire);
